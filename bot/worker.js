@@ -172,11 +172,36 @@ function editFailure(detail) {
 // Подписчики и слежки
 // ---------------------------------------------------------------------------
 
-async function subscribe(env, chatId, info) {
+/**
+ * Заводит подписчика по данным чата. true — человек новый.
+ * Сюда приходят оба пути: и /start, и ссылка, присланная сразу, —
+ * поэтому и о появлении новичка сообщаем отсюда, а не из команды.
+ */
+async function subscribe(env, chatId, chat) {
   const existing = await env.SUBS.get(`subs:${chatId}`);
   if (existing) return false;
-  await env.SUBS.put(`subs:${chatId}`, JSON.stringify(info));
+
+  const name = [chat && chat.first_name, chat && chat.last_name].filter(Boolean).join(" ");
+  const username = (chat && chat.username) || "";
+  await env.SUBS.put(`subs:${chatId}`, JSON.stringify({
+    name,
+    username,
+    since: new Date().toISOString(),
+  }));
+  await announce(env, chatId, name, username);
   return true;
+}
+
+/** Весточка владельцу о новом человеке. О себе самом не сообщаем. */
+async function announce(env, chatId, name, username) {
+  if (!env.OWNER_CHAT_ID || isOwner(env, chatId)) return;
+
+  const who = [name, username ? "@" + username : ""].filter(Boolean).join(" ") || "без имени";
+  // перебор ключей отстаёт от записи, поэтому новичка добавляем к списку сами
+  const total = new Set([...(await subscribers(env)), chatId]).size;
+  await text(env, String(env.OWNER_CHAT_ID),
+    `👤 <b>Новый пользователь</b>: ${esc(who)}\n` +
+    `<code>${chatId}</code> · всего подписчиков: ${total}`);
 }
 
 async function unsubscribe(env, chatId) {
@@ -352,7 +377,7 @@ async function probe(url) {
 // Команды
 // ---------------------------------------------------------------------------
 
-async function addWatch(env, chatId, url, alias) {
+async function addWatch(env, chatId, url, alias, chat) {
   const watches = await userWatches(env, chatId);
   const limit = await limitFor(env, chatId);
   if (watches.length >= limit) {
@@ -389,7 +414,7 @@ async function addWatch(env, chatId, url, alias) {
     created: new Date().toISOString(),
   });
   await saveWatches(env, chatId, watches);
-  await subscribe(env, chatId, { since: new Date().toISOString() });
+  await subscribe(env, chatId, chat);
 
   const lines = [`✅ Слежу за: <b>${esc(found.doctor)}</b>`];
   if (found.speciality) lines.push(esc(found.speciality));
@@ -576,16 +601,12 @@ async function handleUpdate(env, update) {
       return;
     }
     const alias = body.replace(link[0], "").replace(/^\/\w+/, "").trim().slice(0, 60);
-    await addWatch(env, chatId, url, alias);
+    await addWatch(env, chatId, url, alias, chat);
     return;
   }
 
   if (command === "/start") {
-    const isNew = await subscribe(env, chatId, {
-      name,
-      username: chat.username || "",
-      since: new Date().toISOString(),
-    });
+    const isNew = await subscribe(env, chatId, chat);
     await text(env, chatId,
       (isNew ? "✅ Подписал!\n\n" : "Ты уже подписан 👌\n\n") + INTRO);
     if (!isNew) await listWatches(env, chatId);
