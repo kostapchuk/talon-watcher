@@ -71,21 +71,15 @@ const HOW_TO_ADD = [
     "хоть без — тоже сработает.",
 ].join("\n");
 
-/** Интро зависит от личного лимита, поэтому собирается на месте */
-function intro(limit) {
-  return [
-    "Слежу за записью к врачам на talon.by и пишу, как только кнопка " +
-      "«Записаться на платный приём» становится кликабельной.",
-    "",
-    `Можно следить за ${limit} ${plural(limit, "врачом", "врачами", "врачами")} ` +
-      "одновременно. Проверяю раз в 15 минут.",
-    "",
-    "/add <i>ссылка на врача</i> — следить за ним",
-    "/list — мои слежки",
-    "/remove — перестать следить",
-    "/stop — отписаться",
-  ].join("\n");
-}
+const INTRO = [
+  "Слежу за записью к врачам на talon.by и пишу, когда появилась запись. " +
+    "Проверяю возможность записи на приём каждые 15 минут.",
+  "",
+  "/add <i>ссылка на врача</i> — следить за ним",
+  "/list — мои слежки",
+  "/remove — перестать следить",
+  "/stop — отписаться",
+].join("\n");
 
 function plural(count, one, few, many) {
   const tens = count % 100;
@@ -592,8 +586,8 @@ async function handleUpdate(env, update) {
       username: chat.username || "",
       since: new Date().toISOString(),
     });
-    await text(env, chatId, (isNew ? "✅ Подписал!\n\n" : "Ты уже подписан 👌\n\n") +
-      intro(await limitFor(env, chatId)));
+    await text(env, chatId,
+      (isNew ? "✅ Подписал!\n\n" : "Ты уже подписан 👌\n\n") + INTRO);
     if (!isNew) await listWatches(env, chatId);
     return;
   }
@@ -640,7 +634,7 @@ async function handleUpdate(env, update) {
     }
   }
 
-  await text(env, chatId, intro(await limitFor(env, chatId)));
+  await text(env, chatId, INTRO);
 }
 
 // ---------------------------------------------------------------------------
