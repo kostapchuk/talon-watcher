@@ -42,24 +42,31 @@
 const MAX_WATCHES = 3;
 const PAID = "paid"; // вид слежки; для бесплатных талонов будет свой
 
+// Описания видно в меню команд Telegram — по ним человек и понимает,
+// что дописать после команды. Поэтому здесь не «добавить врача»,
+// а прямо образец того, что вставлять.
 const COMMANDS = [
-  { command: "add", description: "Следить за врачом — /add ссылка [название]" },
+  { command: "add", description: "Вставь ссылку на врача с talon.by и, если хочешь, название" },
   { command: "list", description: "Мои слежки и их состояние" },
-  { command: "remove", description: "Перестать следить" },
+  { command: "remove", description: "Перестать следить за врачом" },
   { command: "check", description: "Проверить прямо сейчас" },
   { command: "start", description: "Подписаться на уведомления" },
   { command: "stop", description: "Отписаться от уведомлений" },
 ];
 
+const EXAMPLE_URL = "https://talon.by/policlinic/klinika-merci/doctors/89829";
+
 const HOW_TO_ADD = [
-  "Чтобы начать следить:",
+  "После <code>/add</code> нужна ссылка на страницу врача — вот так:",
   "",
-  "1. Открой на <a href=\"https://talon.by\">talon.by</a> страницу врача",
-  "2. Скопируй адрес из строки браузера",
-  "3. Пришли его мне: <code>/add ссылка</code>",
+  `<code>/add ${EXAMPLE_URL}</code>`,
   "",
-  "Можно сразу дать название — <code>/add ссылка гинеколог</code>, " +
-    "так его и буду называть в уведомлениях.",
+  "Где её взять: открой на <a href=\"https://talon.by\">talon.by</a> нужного врача " +
+    "и скопируй адрес из строки браузера. Ссылку можно прислать и просто " +
+    "сообщением, без команды.",
+  "",
+  "Через пробел можно дописать название — <code>/add ссылка гинеколог</code>. " +
+    "Тогда в уведомлениях врач будет так и подписан.",
 ].join("\n");
 
 const INTRO = [
@@ -68,7 +75,7 @@ const INTRO = [
   "",
   `Можно следить за ${MAX_WATCHES} врачами одновременно. Проверяю раз в 15 минут.`,
   "",
-  "/add — следить за врачом",
+  "/add <i>ссылка на врача</i> — следить за ним",
   "/list — мои слежки",
   "/remove — перестать следить",
   "/check — проверить прямо сейчас",
@@ -340,7 +347,7 @@ async function addWatch(env, chatId, url, alias) {
   if (!found.ok) {
     await text(env, chatId, `Не смог открыть страницу врача: ${found.reason}.\n\n` +
       "Проверь ссылку — она должна выглядеть так:\n" +
-      "<code>https://talon.by/policlinic/klinika-merci/doctors/89829</code>");
+      `<code>${EXAMPLE_URL}</code>`);
     return;
   }
 
@@ -469,7 +476,7 @@ async function handleUpdate(env, update) {
     if (!url) {
       await text(env, chatId,
         "Эту ссылку я пока не понимаю — нужна страница врача, вида\n" +
-        "<code>https://talon.by/policlinic/klinika-merci/doctors/89829</code>\n\n" +
+        `<code>${EXAMPLE_URL}</code>\n\n` +
         "Бесплатные талоны — следующим шагом.");
       return;
     }
