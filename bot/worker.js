@@ -39,7 +39,8 @@
  * таких людей), лежит в конкретных ключах и читается через get, а не list.
  */
 
-const MAX_WATCHES = 3;
+const DEFAULT_MAX_WATCHES = 3;
+const LIMIT_CEILING = 20; // предохранитель от опечатки в /limit
 const PAID = "paid"; // вид слежки; для бесплатных талонов будет свой
 
 // Описания видно в меню команд Telegram — по ним человек и понимает,
@@ -57,30 +58,54 @@ const COMMANDS = [
 const EXAMPLE_URL = "https://talon.by/policlinic/klinika-merci/doctors/89829";
 
 const HOW_TO_ADD = [
-  "После <code>/add</code> нужна ссылка на страницу врача — вот так:",
+  "После <code>/add</code> нужна ссылка на страницу врача — вот такого вида:",
   "",
-  `<code>/add ${EXAMPLE_URL}</code>`,
+  `<code>${EXAMPLE_URL}</code>`,
   "",
-  "Где её взять: открой на <a href=\"https://talon.by\">talon.by</a> нужного врача " +
-    "и скопируй адрес из строки браузера. Ссылку можно прислать и просто " +
-    "сообщением, без команды.",
+  "<b>Где её взять:</b>",
+  "1. Открой <a href=\"https://talon.by/services\">Платные услуги</a> на talon.by " +
+    "и выбери нужную услугу — или сразу найди клинику в " +
+    "<a href=\"https://talon.by/policlinics\">Медучреждениях</a>",
+  "2. В меню учреждения нажми <b>«Врачи»</b>",
+  "3. Открой карточку нужного врача — на ней есть кнопка " +
+    "«Записаться на платный приём»",
+  "4. Скопируй адрес из строки браузера и пришли его мне",
   "",
-  "Через пробел можно дописать название — <code>/add ссылка гинеколог</code>. " +
-    "Тогда в уведомлениях врач будет так и подписан.",
+  "Адрес должен оканчиваться на <code>/doctors/номер</code>. Расписание или " +
+    "страница услуги не подойдут — мне нужен именно врач.",
+  "",
+  `Целиком команда выглядит так:\n<code>/add ${EXAMPLE_URL}</code>`,
+  "",
+  "Ссылку можно прислать и просто сообщением, без команды. А через пробел " +
+    "дописать название — <code>/add ссылка гинеколог</code>: так врач и будет " +
+    "подписан в уведомлениях.",
 ].join("\n");
 
-const INTRO = [
-  "Слежу за записью к врачам на talon.by и пишу, как только кнопка " +
-    "«Записаться на платный приём» становится кликабельной.",
-  "",
-  `Можно следить за ${MAX_WATCHES} врачами одновременно. Проверяю раз в 15 минут.`,
-  "",
-  "/add <i>ссылка на врача</i> — следить за ним",
-  "/list — мои слежки",
-  "/remove — перестать следить",
-  "/check — проверить прямо сейчас",
-  "/stop — отписаться",
-].join("\n");
+/** Интро зависит от личного лимита, поэтому собирается на месте */
+function intro(limit) {
+  return [
+    "Слежу за записью к врачам на talon.by и пишу, как только кнопка " +
+      "«Записаться на платный приём» становится кликабельной.",
+    "",
+    `Можно следить за ${limit} ${plural(limit, "врачом", "врачами", "врачами")} ` +
+      "одновременно. Проверяю раз в 15 минут.",
+    "",
+    "/add <i>ссылка на врача</i> — следить за ним",
+    "/list — мои слежки",
+    "/remove — перестать следить",
+    "/check — проверить прямо сейчас",
+    "/stop — отписаться",
+  ].join("\n");
+}
+
+function plural(count, one, few, many) {
+  const tens = count % 100;
+  if (tens > 10 && tens < 20) return many;
+  const ones = count % 10;
+  if (ones === 1) return one;
+  if (ones >= 2 && ones <= 4) return few;
+  return many;
+}
 
 // Карточка врача: /policlinic/<учреждение>/doctors/<id>.
 // Ровно та же проверка есть в check.py — ссылки в KV лежат уже канонические.
@@ -245,6 +270,19 @@ function newWatchId() {
 }
 
 /**
+ * Сколько слежек разрешено этому человеку. По умолчанию всем поровну,
+ * но владелец может выдать кому-то больше — командой /limit.
+ */
+async function limitFor(env, chatId) {
+  const personal = Number(await env.SUBS.get(`limit:${chatId}`));
+  return personal > 0 ? personal : DEFAULT_MAX_WATCHES;
+}
+
+function isOwner(env, chatId) {
+  return Boolean(env.OWNER_CHAT_ID) && chatId === String(env.OWNER_CHAT_ID);
+}
+
+/**
  * Проверялка сообщила, что у слежек изменилось состояние:
  * [{ chat_id, id, available, booking_url }]. Пишем по одному разу на человека.
  */
@@ -333,9 +371,11 @@ async function probe(url) {
 
 async function addWatch(env, chatId, url, alias) {
   const watches = await userWatches(env, chatId);
-  if (watches.length >= MAX_WATCHES) {
+  const limit = await limitFor(env, chatId);
+  if (watches.length >= limit) {
     await text(env, chatId,
-      `Больше ${MAX_WATCHES} слежек одновременно не потяну. Освободи место: /list`);
+      `Больше ${limit} ${plural(limit, "слежки", "слежек", "слежек")} одновременно ` +
+      "не потяну. Освободи место: /list");
     return;
   }
   if (watches.some((watch) => watch.url === url)) {
@@ -407,7 +447,7 @@ async function listWatches(env, chatId) {
 
   const last = await env.SUBS.get("last_check");
   await text(env, chatId,
-    `Слежу за ${watches.length} из ${MAX_WATCHES}:\n\n` + lines.join("\n\n") +
+    `Слежу за ${watches.length} из ${await limitFor(env, chatId)}:\n\n` + lines.join("\n\n") +
     (moment(last) ? `\n\nПоследняя проверка: ${moment(last)}` : "") +
     "\n\nДобавить ещё — /add");
 }
@@ -457,6 +497,78 @@ async function checkNow(env, chatId) {
   await text(env, chatId, "🔄 Запустил проверку — если что-то изменилось, сейчас напишу.");
 }
 
+// ---------------------------------------------------------------------------
+// Команды владельца. В меню Telegram их нет: оно одно на всех, а эти команды
+// касаются только хозяина бота. Всем остальным они отвечают как незнакомые.
+// ---------------------------------------------------------------------------
+
+/** Кто пользуется ботом: имя, id, сколько слежек и какой лимит */
+async function showUsers(env, chatId) {
+  const chats = await subscribers(env);
+  if (!chats.length) {
+    await text(env, chatId, "Подписчиков пока нет.");
+    return;
+  }
+
+  const lines = [];
+  for (const person of chats) {
+    const info = JSON.parse(await env.SUBS.get(`subs:${person}`) || "{}");
+    const watches = await userWatches(env, person);
+    const limit = await limitFor(env, person);
+    const who = [info.name, info.username ? "@" + info.username : ""]
+      .filter(Boolean).join(" ") || "без имени";
+    lines.push(`• <b>${esc(who)}</b> — <code>${person}</code>\n` +
+      `  слежек ${watches.length} из ${limit}` +
+      (limit === DEFAULT_MAX_WATCHES ? "" : " (личный лимит)"));
+  }
+
+  await text(env, chatId, `Подписчиков: ${chats.length}\n\n` + lines.join("\n") +
+    "\n\nВыдать больше: <code>/limit id число</code>");
+}
+
+/**
+ * /limit             — кому сколько разрешено сверх общего лимита
+ * /limit <id> <n>    — выдать столько-то слежек
+ * /limit <id> 0      — вернуть человека к общему лимиту
+ */
+async function setLimit(env, chatId, args) {
+  if (!args.length) {
+    const listed = await env.SUBS.list({ prefix: "limit:" });
+    const lines = [];
+    for (const key of listed.keys) {
+      const person = key.name.slice("limit:".length);
+      lines.push(`• <code>${person}</code> — ${await env.SUBS.get(key.name)}`);
+    }
+    await text(env, chatId,
+      `Общий лимит: <b>${DEFAULT_MAX_WATCHES}</b>\n\n` +
+      (lines.length ? "Личные лимиты:\n" + lines.join("\n") : "Личных лимитов нет.") +
+      "\n\nВыдать: <code>/limit id число</code>, вернуть к общему: <code>/limit id 0</code>" +
+      "\nЧьи id — смотри /users");
+    return;
+  }
+
+  const person = args[0].replace(/[^\d-]/g, "");
+  const size = Number(args[1]);
+  if (!person || !Number.isInteger(size) || size < 0 || size > LIMIT_CEILING) {
+    await text(env, chatId,
+      `Нужно так: <code>/limit id число</code>, где число от 0 до ${LIMIT_CEILING}. ` +
+      "Ноль — вернуть человека к общему лимиту.");
+    return;
+  }
+
+  if (size === 0) {
+    await env.SUBS.delete(`limit:${person}`);
+    await text(env, chatId, `Вернул <code>${person}</code> к общему лимиту ` +
+      `(${DEFAULT_MAX_WATCHES}). Уже добавленные слежки при этом остаются.`);
+    return;
+  }
+
+  await env.SUBS.put(`limit:${person}`, String(size));
+  await text(env, chatId,
+    `Готово: <code>${person}</code> может следить за ${size} ` +
+    `${plural(size, "врачом", "врачами", "врачами")}.`);
+}
+
 async function handleUpdate(env, update) {
   const message = update.message;
   const chat = message && message.chat;
@@ -491,8 +603,8 @@ async function handleUpdate(env, update) {
       username: chat.username || "",
       since: new Date().toISOString(),
     });
-    await text(env, chatId,
-      (isNew ? "✅ Подписал!\n\n" : "Ты уже подписан 👌\n\n") + INTRO);
+    await text(env, chatId, (isNew ? "✅ Подписал!\n\n" : "Ты уже подписан 👌\n\n") +
+      intro(await limitFor(env, chatId)));
     if (!isNew) await listWatches(env, chatId);
     return;
   }
@@ -529,7 +641,18 @@ async function handleUpdate(env, update) {
     return;
   }
 
-  await text(env, chatId, INTRO);
+  if (isOwner(env, chatId)) {
+    if (command === "/users") {
+      await showUsers(env, chatId);
+      return;
+    }
+    if (command === "/limit") {
+      await setLimit(env, chatId, body.split(/\s+/).slice(1));
+      return;
+    }
+  }
+
+  await text(env, chatId, intro(await limitFor(env, chatId)));
 }
 
 // ---------------------------------------------------------------------------
