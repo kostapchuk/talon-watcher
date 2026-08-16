@@ -1,0 +1,30 @@
+# Конфиг воркера для деплоя из репозитория (Cloudflare Workers Builds).
+#
+# Важно: когда воркер собирается из Git, привязки и переменные берутся отсюда,
+# а не из панели. Что здесь не описано — при деплое пропадёт.
+#
+# Секретов тут нет и быть не должно: BOT_TOKEN, WEBHOOK_SECRET, BROADCAST_SECRET
+# и GH_TOKEN живут в панели (Settings → Variables and Secrets, тип Secret)
+# и деплоем не затираются.
+
+name = "talon-watcher-bot"
+main = "bot/worker.js"
+compatibility_date = "2026-08-01"
+
+# Не секретные настройки — их видно в репозитории, и это нормально
+[vars]
+OWNER_CHAT_ID = "536541305"
+GH_REPO = "kostapchuk/talon-watcher"
+STATE_URL = "https://raw.githubusercontent.com/kostapchuk/talon-watcher/main/state.json"
+
+# Хранилище подписчиков и их слежек.
+# id — идентификатор namespace из панели: Storage & Databases → KV
+[[kv_namespaces]]
+binding = "SUBS"
+id = "ЗАМЕНИ_НА_ID_KV_NAMESPACE"
+
+# Точное расписание: воркер раз в 10 минут просит GitHub запустить проверку.
+# Родной крон GitHub оставлен включённым — он ненадёжен, но и не мешает:
+# одновременные запуски воркфлоу выстраиваются в очередь, а не дублируются.
+[triggers]
+crons = ["*/10 * * * *"]

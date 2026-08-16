@@ -1,0 +1,110 @@
+# Проверка записи к врачам в GitHub Actions — работает независимо от
+# домашнего компьютера.
+#
+# Нужны секреты репозитория (Settings → Secrets and variables → Actions):
+#   BOT_URL, BROADCAST_SECRET
+name: talon-watcher
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # родное расписание GitHub: ненадёжное и с задержками,
+                             # точность обеспечивает расписание Cloudflare
+  repository_dispatch:        # запуск по расписанию Cloudflare и из команды /check
+    types: [check]
+  workflow_dispatch:          # и кнопка «Run workflow» для проверки вручную
+    inputs:
+      ping:
+        description: "Только проверить связку с ботом (тестовое сообщение)"
+        type: boolean
+        default: false
+
+# чтобы шаг ниже мог закоммитить обновлённый state.json
+permissions:
+  contents: write
+
+concurrency:
+  group: talon-watcher
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # полная история обязательна: из клона глубины 1 force-push
+          # отправляет историю, обрезанную на границе клона, и сносит всё
+          # предыдущее
+          fetch-depth: 0
+
+      - name: Проверить запись
+        env:
+          # рассылка идёт через бота на Cloudflare Workers — подписчики живут там
+          BOT_URL: ${{ secrets.BOT_URL }}
+          BROADCAST_SECRET: ${{ secrets.BROADCAST_SECRET }}
+          # отчёт владельцу: edit — одно сообщение с временем, every — каждый раз
+          HEARTBEAT: ${{ vars.HEARTBEAT || 'edit' }}
+          # кому жаловаться, если сайт не открывается несколько проверок подряд
+          OWNER_CHAT_ID: ${{ vars.OWNER_CHAT_ID }}
+          # запасной путь: если бот не настроен, шлём напрямую владельцу
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 check.py --verbose ${{ inputs.ping && '--ping' || '' }}
+
+      - name: Сохранить состояние
+        run: |
+          git config user.name "talon-watcher"
+          git config user.email "talon-watcher@users.noreply.github.com"
+
+          # Запуски могут наложиться (расписание GitHub + расписание Cloudflare),
+          # и тогда push второго отвергается. Поэтому каждую попытку начинаем с
+          # актуальной истории: переносим HEAD на origin/main, сохранив свой
+          # state.json в рабочем каталоге.
+          for attempt in 1 2 3; do
+            git fetch -q origin main
+            git reset -q --mixed origin/main
+            git add state.json
+
+            # checked_utc/updated_utc/fails меняются каждый запуск — ради них
+            # коммитить не стоит, иначе история превратится в сотни коммитов
+            # в сутки. Признак жизни хранится не здесь, а у бота (KV, last_check).
+            # (|| true — grep без совпадений возвращает 1, а шаг идёт с set -e)
+            meaningful=$(git diff --staged -U0 -- state.json \
+              | grep -E '^[+-]' \
+              | grep -vE '^(\+\+\+|---)' \
+              | grep -vE '"(updated_utc|checked_utc|fails)"' || true)
+
+            if [ -z "$meaningful" ]; then
+              # Ничего не изменилось. Но раз в час всё же обновляем отметку
+              # времени: по репозиторию должно быть видно, что вотчер жив, без
+              # похода в Actions. Заодно это держит репозиторий активным —
+              # GitHub отключает расписание после 60 дней тишины.
+              age=$(( $(date +%s) - $(git log -1 --format=%ct) ))
+              if [ "$age" -lt 3600 ]; then
+                exit 0
+              fi
+            fi
+
+            # если предыдущий коммит — тоже состояние, дополняем его вместо
+            # нового: в истории остаётся один такой коммит с последней датой.
+            # На всякий случай ещё раз убеждаемся, что клон не усечённый:
+            # переписывать историю в нём нельзя ни при каких условиях.
+            if [ "$(git rev-parse --is-shallow-repository)" = "false" ] \
+               && git log -1 --pretty=%s | grep -q '^state: ' \
+               && [ "$(git log -1 --pretty=%an)" = "talon-watcher" ]; then
+              # --date=now обязателен: без него правка сохраняет исходную дату
+              # автора, и GitHub показывает старое время у свежего коммита
+              git commit --amend --date=now -m "state: $(date -u +%FT%TZ)"
+              git push --force-with-lease origin HEAD:main && exit 0
+            else
+              git commit -m "state: $(date -u +%FT%TZ)"
+              git push origin HEAD:main && exit 0
+            fi
+
+            echo "push не прошёл (попытка $attempt), обновляюсь и пробую снова"
+            sleep $(( attempt * 5 ))
+          done
+
+          echo "не смог записать состояние за три попытки" >&2
+          exit 1
