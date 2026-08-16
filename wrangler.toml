@@ -7,7 +7,9 @@
 # и GH_TOKEN живут в панели (Settings → Variables and Secrets, тип Secret)
 # и деплоем не затираются.
 
-name = "talon-watcher-bot"
+# Имя должно совпадать с воркером в панели: при сборке из репозитория CI
+# подставляет своё и ругается на расхождение
+name = "talon-watcher"
 main = "bot/worker.js"
 compatibility_date = "2026-08-01"
 
