@@ -3,28 +3,35 @@
  * и отвечает мгновенно.
  *
  * Разделение обязанностей:
- *   - этот бот — общение с людьми: подписки, ссылки на врачей, команды;
- *   - GitHub Actions — обход страниц по расписанию. Список слежек он забирает
- *     здесь (GET /watches), а готовые сообщения отдаёт обратно (POST /notify).
+ *   - этот бот — общение с людьми и всё хранилище: подписки, слежки и то,
+ *     что мы в последний раз видели на странице;
+ *   - GitHub Actions — обход страниц по расписанию. Слежки вместе с последним
+ *     известным состоянием он забирает здесь (GET /watches), а сообщения
+ *     и случившиеся переходы отдаёт обратно (POST /notify).
+ *
+ * Проверялка сама ничего не помнит: она открывает страницу и говорит, что там
+ * сейчас. Всё, что должно пережить запуск, — это поле available на слежке,
+ * то есть один бит «мы уже сказали, что открыто». Ради него отдельное
+ * хранилище не заводится: живёт там же, где сама слежка.
  *
  * Ещё воркер по расписанию (cron в wrangler.toml) дёргает проверку в GitHub
- * через repository_dispatch: у Cloudflare расписание точное, а обход сайта
- * и состояние остаются в одном экземпляре — в Actions.
+ * через repository_dispatch: у Cloudflare расписание точное.
  *
  * Настройки в панели Cloudflare (Workers → Settings):
  *   Variables:  BOT_TOKEN, WEBHOOK_SECRET, BROADCAST_SECRET, OWNER_CHAT_ID,
- *               STATE_URL, GH_TOKEN, GH_REPO
+ *               GH_TOKEN, GH_REPO
  *   KV binding: SUBS
  * При сборке из репозитория привязка и несекретные переменные берутся
  * из wrangler.toml.
  *
  * Ключи в KV:
  *   subs:<chatId>      — подписчик
- *   watch:<chatId>     — все слежки человека, одним списком
+ *   watch:<chatId>     — все слежки человека вместе с их состоянием, одним списком
  *   index:watches      — чаты, у которых слежки есть
  *   heartbeat:<chatId> — сообщение-табло с временем проверки
  *   trigger:<chatId>   — когда человек последний раз просил проверить вручную
  *   last_check         — когда проверка отчитывалась в последний раз
+ *   fails              — сколько проверок подряд сайт не открывается
  *
  * Почему такая схема: в KV операция list согласована лишь в конечном счёте —
  * только что записанный ключ может не попадать в перебор ещё около минуты.
@@ -59,7 +66,7 @@ const INTRO = [
   "Слежу за записью к врачам на talon.by и пишу, как только кнопка " +
     "«Записаться на платный приём» становится кликабельной.",
   "",
-  `Можно следить за ${MAX_WATCHES} врачами одновременно. Проверяю раз в 10 минут.`,
+  `Можно следить за ${MAX_WATCHES} врачами одновременно. Проверяю раз в 5 минут.`,
   "",
   "/add — следить за врачом",
   "/list — мои слежки",
@@ -170,7 +177,7 @@ async function subscribers(env) {
   return [...ids];
 }
 
-/** Слежки одного человека: [{ id, url, alias, kind, created }] */
+/** Слежки одного человека: [{ id, url, alias, kind, doctor, available, ... }] */
 async function userWatches(env, chatId) {
   const stored = await env.SUBS.get(`watch:${chatId}`);
   return stored ? JSON.parse(stored) : [];
@@ -217,6 +224,9 @@ async function allWatches(env) {
         url: watch.url,
         alias: watch.alias || "",
         kind: watch.kind || PAID,
+        // что мы видели в прошлый раз — по этому проверялка и поймёт,
+        // случился ли переход, о котором надо написать
+        available: Boolean(watch.available),
       });
     }
   }
@@ -225,6 +235,38 @@ async function allWatches(env) {
 
 function newWatchId() {
   return Math.random().toString(36).slice(2, 8);
+}
+
+/**
+ * Проверялка сообщила, что у слежек изменилось состояние:
+ * [{ chat_id, id, available, booking_url }]. Пишем по одному разу на человека.
+ */
+async function applyStatuses(env, statuses) {
+  const byChat = new Map();
+  for (const status of statuses || []) {
+    const chatId = String(status.chat_id || "");
+    if (!chatId || !status.id) continue;
+    if (!byChat.has(chatId)) byChat.set(chatId, []);
+    byChat.get(chatId).push(status);
+  }
+
+  let updated = 0;
+  for (const [chatId, changes] of byChat) {
+    const watches = await userWatches(env, chatId);
+    let touched = false;
+    for (const change of changes) {
+      const watch = watches.find((item) => item.id === change.id);
+      // слежку могли убрать, пока шла проверка — тогда и записывать нечего
+      if (!watch || Boolean(watch.available) === Boolean(change.available)) continue;
+      watch.available = Boolean(change.available);
+      watch.bookingUrl = change.available ? (change.booking_url || "") : "";
+      watch.changed = new Date().toISOString();
+      touched = true;
+      updated++;
+    }
+    if (touched) await saveWatches(env, chatId, watches);
+  }
+  return updated;
 }
 
 // ---------------------------------------------------------------------------
@@ -279,24 +321,6 @@ async function probe(url) {
 }
 
 // ---------------------------------------------------------------------------
-// Текущее состояние — из state.json, который коммитит GitHub Actions
-// ---------------------------------------------------------------------------
-
-async function loadState(env) {
-  try {
-    const response = await fetch(env.STATE_URL, {
-      cf: { cacheTtl: 0 },
-      headers: { "cache-control": "no-cache" },
-    });
-    if (!response.ok) throw new Error(`state.json -> ${response.status}`);
-    return await response.json();
-  } catch (error) {
-    console.error("не смог прочитать state.json:", error);
-    return null;
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Команды
 // ---------------------------------------------------------------------------
 
@@ -326,6 +350,12 @@ async function addWatch(env, chatId, url, alias) {
     alias: alias || "",
     kind: PAID,
     doctor: found.doctor,
+    speciality: found.speciality,
+    // состояние знаем прямо сейчас — записываем его сразу, иначе первая же
+    // проверка сочтёт открытую запись новостью и напишет о ней второй раз
+    available: found.available,
+    bookingUrl: found.bookingUrl,
+    changed: new Date().toISOString(),
     created: new Date().toISOString(),
   });
   await saveWatches(env, chatId, watches);
@@ -343,7 +373,7 @@ async function addWatch(env, chatId, url, alias) {
     lines.push("🎉 <b>Запись уже открыта!</b>",
       `👉 <a href="${esc(found.bookingUrl)}">Записаться на платный приём</a>`);
   } else {
-    lines.push("Сейчас записи нет — проверяю каждые 10 минут и напишу, как только откроется.");
+    lines.push("Сейчас записи нет — проверяю каждые 5 минут и напишу, как только откроется.");
   }
   lines.push("", "Мои слежки: /list");
   await text(env, chatId, lines.join("\n"));
@@ -356,24 +386,22 @@ async function listWatches(env, chatId) {
     return;
   }
 
-  const state = await loadState(env);
-  const doctors = (state && state.doctors) || {};
   const lines = watches.map((watch, index) => {
-    const known = doctors[watch.url] || {};
-    const title = watch.alias || known.doctor || watch.doctor || "врач";
-    const status = known.available
-      ? (known.booking_url
-        ? `🎉 <a href="${esc(known.booking_url)}">запись открыта</a>`
+    const title = watch.alias || watch.doctor || "врач";
+    const status = watch.available
+      ? (watch.bookingUrl
+        ? `🎉 <a href="${esc(watch.bookingUrl)}">запись открыта</a>`
         : "🎉 запись открыта")
-      : (Object.keys(known).length ? "⏳ записи нет" : "⏳ ещё не проверял");
+      : "⏳ записи нет";
     return `${index + 1}. <b>${esc(title)}</b> — ${status}\n` +
-      `${known.doctor && watch.alias ? esc(known.doctor) + "\n" : ""}` +
+      `${watch.doctor && watch.alias ? esc(watch.doctor) + "\n" : ""}` +
       `<a href="${esc(watch.url)}">карточка</a> · убрать: /remove_${watch.id}`;
   });
 
+  const last = await env.SUBS.get("last_check");
   await text(env, chatId,
     `Слежу за ${watches.length} из ${MAX_WATCHES}:\n\n` + lines.join("\n\n") +
-    (state && moment(state.updated_utc) ? `\n\nПоследняя проверка: ${moment(state.updated_utc)}` : "") +
+    (moment(last) ? `\n\nПоследняя проверка: ${moment(last)}` : "") +
     "\n\nДобавить ещё — /add");
 }
 
@@ -506,14 +534,19 @@ async function handleWatches(env) {
 }
 
 /**
- * Готовые сообщения от проверялки: [{ chat_id, text }].
- * Текст собирает она — только он знает, что и кому именно изменилось.
+ * Итог проверки: готовые сообщения [{ chat_id, text }] и случившиеся переходы
+ * [{ chat_id, id, available, booking_url }]. Тексты собирает проверялка —
+ * только она знает, что именно изменилось.
+ *
+ * Сначала отправляем, потом записываем: если запись в KV сорвётся, человек
+ * получит уведомление дважды — неприятно, но лучше, чем не получить вовсе.
  */
 async function handleNotify(env, request) {
   const payload = await request.json().catch(() => null);
-  const messages = payload && payload.messages;
-  if (!messages || !messages.length) {
-    return new Response("нужен непустой messages[]", { status: 400 });
+  const messages = (payload && payload.messages) || [];
+  const statuses = (payload && payload.statuses) || [];
+  if (!messages.length && !statuses.length) {
+    return new Response("нужны messages[] или statuses[]", { status: 400 });
   }
 
   let delivered = 0;
@@ -535,7 +568,27 @@ async function handleNotify(env, request) {
     }
   }
 
-  return Response.json({ delivered, failed, dropped: dropped.size });
+  const updated = await applyStatuses(env, statuses);
+  return Response.json({ delivered, failed, dropped: dropped.size, updated });
+}
+
+/**
+ * Считаем проверки, в которых сайт не открылся ни разу, и на третьей будим
+ * владельца: вотчер, который молча ничего не проверяет, выглядит ровно так же,
+ * как вотчер, которому нечего сообщить. Второй раз напоминаем на тридцатой,
+ * чтобы не превращать поломку в поток сообщений.
+ */
+async function countFailures(env, failedAll) {
+  if (!failedAll) {
+    if (await env.SUBS.get("fails")) await env.SUBS.delete("fails");
+    return;
+  }
+  const fails = Number(await env.SUBS.get("fails") || 0) + 1;
+  await env.SUBS.put("fails", String(fails));
+  if ((fails === 3 || fails === 30) && env.OWNER_CHAT_ID) {
+    await text(env, String(env.OWNER_CHAT_ID),
+      `⚠️ Не могу открыть talon.by — ${fails} проверки подряд. Посмотри логи Actions.`);
+  }
 }
 
 /**
@@ -551,9 +604,12 @@ async function handleHeartbeat(env, request) {
   const body = payload?.text;
   if (!chatId || !body) return new Response("нужны chat_id и text", { status: 400 });
 
-  // признак жизни: в state.json его держать нельзя — там отметка обновляется
-  // вместе с состоянием, а нам нужен факт самого запуска
   await env.SUBS.put("last_check", new Date().toISOString());
+  await countFailures(env, Boolean(payload.failed_all));
+
+  // HEARTBEAT=off — проверялка всё равно приходит сюда, чтобы отметиться;
+  // сообщение при этом не нужно, а тревога о недоступном сайте уже ушла
+  if (payload.mode === "off") return Response.json({ noted: true });
 
   if (payload.mode === "edit") {
     const known = await env.SUBS.get(`heartbeat:${chatId}`);
@@ -674,6 +730,7 @@ export default {
     if (url.pathname === "/health") {
       return Response.json({
         last_check: env.SUBS ? await env.SUBS.get("last_check") : null,
+        fails: env.SUBS ? Number(await env.SUBS.get("fails") || 0) : null,
         kv_binding_SUBS: Boolean(env.SUBS),
         BOT_TOKEN: Boolean(env.BOT_TOKEN),
         WEBHOOK_SECRET: Boolean(env.WEBHOOK_SECRET),
@@ -681,7 +738,6 @@ export default {
         GH_TOKEN: Boolean(env.GH_TOKEN),
         GH_REPO: env.GH_REPO || null,
         OWNER_CHAT_ID: env.OWNER_CHAT_ID || null,
-        STATE_URL: env.STATE_URL || null,
       });
     }
 

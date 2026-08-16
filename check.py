@@ -2,9 +2,13 @@
 """
 Слежка за записью к врачам на talon.by.
 
-Обходит карточки врачей, за которыми следят подписчики (список забирает
-у бота на Cloudflare Workers), и сообщает, когда кнопка «Записаться на
-платный приём» становится кликабельной — и когда снова гаснет.
+Обходит карточки врачей, за которыми следят подписчики, и сообщает, когда
+кнопка «Записаться на платный приём» становится кликабельной — и когда снова
+гаснет.
+
+Ничего не помнит между запусками: и список слежек, и то, что мы видели
+в прошлый раз, живут в KV у бота. Здесь только «открыл страницу — посмотрел,
+что на ней сейчас — рассказал боту, что изменилось».
 
 Зависимостей нет — только стандартная библиотека.
 """
@@ -23,7 +27,6 @@ import urllib.parse
 import urllib.request
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_FILE = os.path.join(BASE_DIR, "state.json")
 LOG_FILE = os.path.join(BASE_DIR, "watcher.log")
 
 SITE = "https://talon.by"
@@ -47,7 +50,7 @@ CLOSED_RE = re.compile(
     r'<span\s[^>]*class="[^"]*\bnotAvailable\b[^"]*"[^>]*>\s*' + PAID_LABEL, re.I)
 
 PAID = "paid"  # вид слежки; для бесплатных талонов будет свой
-MISSES_BEFORE_CLOSED = 2  # сколько обходов подряд кнопка гаснет, чтобы счесть запись закрытой
+RECHECK_PAUSE = 5  # пауза перед перепроверкой пропавшей кнопки, секунды
 MAX_MESSAGES_PER_CALL = 20  # у Cloudflare на бесплатном тарифе 50 подзапросов на запрос
 
 log = logging.getLogger("talon-watcher")
@@ -119,8 +122,7 @@ def parse_doctor(page_html):
 
     Кнопка бывает в трёх видах: ссылка (запись открыта), серая заглушка
     (закрыта) и её отсутствие — у врача просто нет платного приёма. Последнее
-    от закрытой записи отличаем: молча ждать открытия, которого не будет, —
-    худшее, что может сделать вотчер.
+    бот замечает ещё при добавлении и сразу предупреждает.
     """
     header = re.search(r'(?s)<div\s+id="doctor_header".{0,4000}', page_html)
     block = header.group(0) if header else ""
@@ -132,8 +134,6 @@ def parse_doctor(page_html):
         raise RuntimeError("не узнал разметку страницы: нет карточки врача")
 
     open_button = OPEN_RE.search(page_html)
-    has_button = bool(open_button or CLOSED_RE.search(page_html))
-
     return {
         "doctor": clean(name.group(1)),
         "speciality": clean(speciality.group(1)) if speciality else "",
@@ -141,7 +141,7 @@ def parse_doctor(page_html):
         "clinic": clean(title.group(1)).split("–")[-1].strip() if title else "",
         "available": bool(open_button),
         "booking_url": urllib.parse.urljoin(SITE, open_button.group(1)) if open_button else "",
-        "has_button": has_button,
+        "has_button": bool(open_button or CLOSED_RE.search(page_html)),
     }
 
 
@@ -164,14 +164,8 @@ def esc(value):
     return html.escape(str(value or ""))
 
 
-def label(watch):
-    """Как называть слежку в сообщении: алиас человека или имя врача."""
-    return watch.get("alias") or watch.get("doctor") or "приём"
-
-
-def format_open(info, url, alias, first_seen=False):
-    head = "🎉 <b>Открылась запись</b>" if not first_seen else "✅ <b>Запись открыта</b>"
-    lines = [f"{head}{f' · «{esc(alias)}»' if alias else ''}", ""]
+def format_open(info, url, alias):
+    lines = [f"🎉 <b>Открылась запись</b>{f' · «{esc(alias)}»' if alias else ''}", ""]
     lines.append(f"<b>{esc(info.get('doctor'))}</b>")
     if info.get("speciality"):
         lines.append(esc(info["speciality"]))
@@ -190,18 +184,8 @@ def format_closed(info, url, alias):
     if info.get("speciality"):
         lines.append(esc(info["speciality"]))
     lines.append("")
-    lines.append(f'Слежу дальше — напишу, когда откроется снова.\n'
+    lines.append("Слежу дальше — напишу, когда откроется снова.\n"
                  f'<a href="{esc(url)}">Карточка врача</a>')
-    return "\n".join(lines)
-
-
-def format_no_button(info, url, alias):
-    lines = [f"⚠️ <b>Платного приёма нет</b>{f' · «{esc(alias)}»' if alias else ''}", ""]
-    lines.append(esc(info.get("doctor")))
-    lines.append("")
-    lines.append("На странице врача нет кнопки платной записи — следить не за чем. "
-                 "Похоже, приём ведётся только по бесплатным талонам.")
-    lines.append(f'<a href="{esc(url)}">Карточка врача</a>')
     return "\n".join(lines)
 
 
@@ -273,12 +257,13 @@ def telegram_send(text, chat_id):
         return json.loads(resp.read().decode())
 
 
-def notify(messages):
+def report(messages, statuses):
     """
-    Отдаём боту готовые сообщения — [{chat_id, text}]. Он их разошлёт и сам
-    отпишет тех, кто заблокировал бота.
+    Итог обхода боту: что разослать и у каких слежек изменилось состояние.
+    Записи в KV делает он же — так отправка и запоминание происходят в одном
+    месте и не разъезжаются.
     """
-    if not messages:
+    if not messages and not statuses:
         return
     if not bot_configured():
         chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -289,31 +274,39 @@ def notify(messages):
             telegram_send(message["text"], chat_id)
         return
 
-    for start in range(0, len(messages), MAX_MESSAGES_PER_CALL):
-        batch = messages[start:start + MAX_MESSAGES_PER_CALL]
-        result = bot_call("/notify", {"messages": batch})
-        log.info("  отправлено %s, не доставлено %s, отписано %s",
-                 result.get("delivered"), result.get("failed"), result.get("dropped"))
+    # переходы отдаём вместе с последней порцией сообщений: сначала люди
+    # получают уведомления, только потом мы записываем, что уведомили
+    chunks = [messages[start:start + MAX_MESSAGES_PER_CALL]
+              for start in range(0, len(messages), MAX_MESSAGES_PER_CALL)] or [[]]
+    for number, chunk in enumerate(chunks):
+        result = bot_call("/notify", {
+            "messages": chunk,
+            "statuses": statuses if number == len(chunks) - 1 else [],
+        })
+        log.info("  отправлено %s, не доставлено %s, отписано %s, записано %s",
+                 result.get("delivered"), result.get("failed"),
+                 result.get("dropped"), result.get("updated"))
 
 
-def heartbeat(summary):
+def heartbeat(summary, failed_all=False):
     """
     Отчёт владельцу о прошедшей проверке.
     HEARTBEAT: off — молчим, edit — переписываем одно сообщение, every — новое.
+    Заодно это единственный признак жизни: бот по нему считает, когда проверка
+    была в последний раз, и сколько раз подряд сайт не открывался.
     """
     mode = os.environ.get("HEARTBEAT", "edit").strip().lower()
-    if mode == "off":
-        return
 
-    # в отчёте человеку — местное время; в state.json остаётся UTC,
-    # чтобы машинам было однозначно
+    # в отчёте человеку — местное время; между машинами всё в UTC
     offset = int(os.environ.get("REPORT_UTC_OFFSET", "3"))
     stamp = time.strftime("%H:%M", time.gmtime(time.time() + offset * 3600))
     text = f"✅ <b>Проверка пройдена</b> · {stamp}\n{summary}"
     try:
         if bot_configured():
-            bot_call("/heartbeat", {"text": text, "mode": mode})
-        else:
+            # даже при HEARTBEAT=off зовём бота: сообщение он не пошлёт, но
+            # отметку о проверке и счётчик неудач обновит
+            bot_call("/heartbeat", {"text": text, "mode": mode, "failed_all": failed_all})
+        elif mode != "off":
             chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
             if chat_id:
                 telegram_send(text, chat_id)
@@ -322,53 +315,26 @@ def heartbeat(summary):
 
 
 # --------------------------------------------------------------------------- #
-# state
-# --------------------------------------------------------------------------- #
-
-def load_state():
-    """
-    Состояние: по ссылке на врача — что мы видели в прошлый раз.
-    Ключ — сама ссылка: она уже канонична и одна на всех, кто за врачом следит.
-    """
-    if not os.path.exists(STATE_FILE):
-        return {"doctors": {}, "fails": 0, "updated_utc": None}
-    with open(STATE_FILE, encoding="utf-8") as fh:
-        state = json.load(fh)
-    state.setdefault("doctors", {})
-    state.setdefault("fails", 0)
-    return state
-
-
-def save_state(state):
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(state, fh, ensure_ascii=False, indent=2)
-    os.replace(tmp, STATE_FILE)
-
-
-def utc_now():
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-# --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
 
 def collect_jobs():
     """
-    Что обходить: ссылка → список следящих за ней слежек.
-    Одну и ту же страницу несколько человек могут смотреть под разными
-    названиями — качаем её один раз, сообщения потом у каждого свои.
+    Что обходить: ссылка → следящие за ней слежки со своим последним
+    известным состоянием. Одну и ту же страницу несколько человек могут
+    смотреть под разными названиями — качаем её один раз.
     """
     info = bot_get("/watches") if bot_configured() else None
     if info is None:
-        # локальный прогон без бота: следим за тем, что задано в .env
+        # локальный прогон без бота: ссылки из .env, состояние помнить негде,
+        # поэтому просто показываем, что на страницах сейчас
         chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
         jobs = {}
         for raw in os.environ.get("WATCH_URLS", "").split(","):
             url = normalize_url(raw)
             if url:
-                jobs.setdefault(url, []).append({"chat_id": chat_id, "alias": "", "kind": PAID})
+                jobs.setdefault(url, []).append(
+                    {"id": "local", "chat_id": chat_id, "alias": "", "available": False})
         return jobs
 
     jobs = {}
@@ -380,17 +346,44 @@ def collect_jobs():
         if watch.get("kind", PAID) != PAID:
             continue  # бесплатные талоны — следующий шаг, у них своя разметка
         jobs.setdefault(url, []).append({
+            "id": watch.get("id"),
             "chat_id": str(watch.get("chat_id")),
             "alias": watch.get("alias") or "",
-            "kind": PAID,
+            "available": bool(watch.get("available")),
         })
     return jobs
 
 
-def run(args):
-    state = load_state()
-    known = state["doctors"]
+def look(url, watchers):
+    """
+    Что на странице сейчас. None — посмотреть не удалось.
 
+    Если кнопка пропала у слежки, которая считалась открытой, страницу качаем
+    ещё раз: выдача сайта иногда мигает, и поспешное «закрылась» обернулось бы
+    парой ложных сообщений подряд. Открытие так не перепроверяем — там дорога
+    каждая секунда.
+    """
+    try:
+        info = scrape(url)
+    except Exception as exc:
+        log.error("%s: %s", url, exc)
+        return None
+
+    if info["available"] or not any(watcher["available"] for watcher in watchers):
+        return info
+
+    log.info("кнопка пропала — перепроверяю через %d с", RECHECK_PAUSE)
+    time.sleep(RECHECK_PAUSE)
+    try:
+        return scrape(url)
+    except Exception as exc:
+        # первый ответ говорил «закрыто», но подтвердить его нечем —
+        # лучше промолчать и вернуться к этому через пять минут
+        log.error("перепроверка не удалась (%s) — оставляю как было", exc)
+        return None
+
+
+def run(args):
     try:
         jobs = collect_jobs()
     except Exception as exc:
@@ -399,137 +392,65 @@ def run(args):
 
     if not jobs:
         log.info("следить не за чем — подписок нет")
-        state["updated_utc"] = utc_now()
-        state["doctors"] = {}
-        state["fails"] = 0
         if not args.dry_run:
-            save_state(state)
             heartbeat("Слежек нет.")
         return 0
 
     log.info("страниц к обходу: %d", len(jobs))
 
-    fresh, messages, failures = {}, [], []
+    messages, statuses, failures = [], [], []
     opened = closed = 0
 
     for url, watchers in jobs.items():
-        previous = known.get(url, {})
-        try:
-            info = scrape(url)
-        except Exception as exc:
-            log.error("%s: %s", url, exc)
+        info = look(url, watchers)
+        if info is None:
             failures.append(url)
-            if previous:  # состояние не трогаем, иначе после сбоя всё покажется новым
-                fresh[url] = previous
             continue
 
-        first_seen = "available" not in previous
-        was_open = bool(previous.get("available"))
-        misses = int(previous.get("misses", 0))
+        log.info("%s — %s", info["doctor"] or url,
+                 "запись открыта" if info["available"] else "записи нет")
 
-        if info["available"]:
-            misses = 0
-            available = True
-        else:
-            # Мигание выдачи — обычное дело: одна пропажа кнопки ещё не значит,
-            # что запись закрыли. Открытие сообщаем сразу, закрытие — только
-            # подтверждённое, иначе человек получит «закрылась/открылась» подряд.
-            misses += 1
-            available = was_open and misses < MISSES_BEFORE_CLOSED
-
-        unchanged = available == was_open and not first_seen
-        fresh[url] = {
-            "kind": PAID,
-            "available": available,
-            # пока закрытие не подтверждено, держим прошлую ссылку на запись:
-            # в /list у бота она ещё считается рабочей
-            "booking_url": info["booking_url"] or (previous.get("booking_url", "")
-                                                   if available else ""),
-            "doctor": info["doctor"],
-            "speciality": info["speciality"],
-            "clinic": info["clinic"],
-            "has_button": info["has_button"],
-            "misses": misses,
-            "checked_utc": utc_now(),
-            "changed_utc": previous.get("changed_utc") if unchanged else utc_now(),
-        }
-
-        log.info("%s — %s%s", info["doctor"] or url,
-                 "запись открыта" if available else "записи нет",
-                 "" if info["has_button"] else " (кнопки платного приёма вообще нет)")
-
-        if args.init:
-            continue
-
-        # Сообщаем только о переходах: открылось то, чего не было, или наоборот.
-        if available and not was_open:
-            opened += 1
-            for watcher in watchers:
-                messages.append({
-                    "chat_id": watcher["chat_id"],
-                    "text": format_open(info, url, watcher["alias"], first_seen=first_seen),
-                })
-        elif was_open and not available:
-            closed += 1
-            for watcher in watchers:
-                messages.append({
-                    "chat_id": watcher["chat_id"],
-                    "text": format_closed(info, url, watcher["alias"]),
-                })
-
-        # Кнопки платного приёма нет вовсе — говорим один раз, при первой встрече:
-        # ждать открытия тут бессмысленно, пусть человек решает, что делать.
-        if first_seen and not info["has_button"]:
-            for watcher in watchers:
-                messages.append({
-                    "chat_id": watcher["chat_id"],
-                    "text": format_no_button(info, url, watcher["alias"]),
-                })
-
-    if failures and len(failures) == len(jobs):
-        state["fails"] = state.get("fails", 0) + 1
-        state["doctors"] = fresh
-        if not args.dry_run:
-            save_state(state)
-        log.error("ни одна страница не открылась (%d раз подряд)", state["fails"])
-        if state["fails"] in (3, 30) and not args.dry_run:
-            owner = os.environ.get("OWNER_CHAT_ID", "").strip()
-            if owner:
-                try:
-                    notify([{"chat_id": owner,
-                             "text": "⚠️ Вотчер не может открыть talon.by "
-                                     f"({state['fails']} раза подряд). Посмотри логи."}])
-                except Exception as exc:
-                    log.error("и в Telegram не ушло: %s", exc)
-        return 1
+        for watcher in watchers:
+            if info["available"] == watcher["available"]:
+                continue  # ничего не изменилось — и говорить не о чем
+            if info["available"]:
+                opened += 1
+                messages.append({"chat_id": watcher["chat_id"],
+                                 "text": format_open(info, url, watcher["alias"])})
+            else:
+                closed += 1
+                messages.append({"chat_id": watcher["chat_id"],
+                                 "text": format_closed(info, url, watcher["alias"])})
+            statuses.append({
+                "chat_id": watcher["chat_id"],
+                "id": watcher["id"],
+                "available": info["available"],
+                "booking_url": info["booking_url"],
+            })
 
     if args.dry_run:
         for message in messages:
             print(f"\n=== чат {message['chat_id']}\n{message['text']}")
-    elif messages:
-        notify(messages)
+        print(f"\n=== переходов записать: {len(statuses)}")
+        return 0
 
-    # За кем больше не следят — забываем: вернут ссылку обратно, и первая
-    # проверка честно покажет текущее состояние.
-    state["doctors"] = fresh
-    state["fails"] = 0
-    state["updated_utc"] = utc_now()
+    failed_all = bool(failures) and len(failures) == len(jobs)
+    if failed_all:
+        log.error("ни одна страница не открылась")
+    else:
+        report(messages, statuses)
 
-    if not args.dry_run:
-        if not args.init:
-            heartbeat(f"Слежек: {sum(len(w) for w in jobs.values())} · страниц: {len(jobs)} · "
-                      f"открылось: {opened} · закрылось: {closed}" +
-                      (f"\n⚠️ не открылись: {len(failures)}" if failures else ""))
-        save_state(state)
-    return 0
+    heartbeat(f"Слежек: {sum(len(w) for w in jobs.values())} · страниц: {len(jobs)} · "
+              f"открылось: {opened} · закрылось: {closed}" +
+              (f"\n⚠️ не открылись: {len(failures)}" if failures else ""),
+              failed_all=failed_all)
+    return 1 if failed_all else 0
 
 
 def main():
     parser = argparse.ArgumentParser(description="Вотчер записи к врачам talon.by → Telegram")
-    parser.add_argument("--init", action="store_true",
-                        help="запомнить текущее состояние, ничего не отправляя")
     parser.add_argument("--dry-run", action="store_true",
-                        help="печатать сообщения в консоль вместо Telegram")
+                        help="печатать сообщения в консоль вместо отправки")
     parser.add_argument("--ping", action="store_true",
                         help="проверить связку с ботом: тестовое сообщение владельцу и выход")
     parser.add_argument("--watches", action="store_true",
@@ -559,20 +480,23 @@ def main():
         return 0
 
     if args.ping:
-        owner = os.environ.get("OWNER_CHAT_ID", "").strip() \
-            or os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-        if not owner:
-            print("не задан OWNER_CHAT_ID")
+        note = ("🧪 Проверка связи: GitHub Actions → бот → Telegram.\n"
+                "Если это сообщение пришло, рассылка настроена верно.")
+        if bot_configured():
+            # кому писать, знает сам бот (OWNER_CHAT_ID в его переменных)
+            bot_call("/heartbeat", {"text": note, "mode": "every"})
+            print("Отправлено через бота владельцу.")
+            return 0
+        chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+        if not chat_id:
+            print("не задан ни BOT_URL, ни TELEGRAM_CHAT_ID")
             return 2
-        notify([{"chat_id": owner,
-                 "text": "🧪 Проверка связи: GitHub Actions → бот → Telegram.\n"
-                         "Если это сообщение пришло, рассылка настроена верно."}])
-        print("Отправлено " + ("через бота." if bot_configured() else "напрямую."))
+        telegram_send(note, chat_id)
+        print("Отправлено напрямую.")
         return 0
 
     if args.if_stale:
-        # когда проверка отчитывалась в последний раз, знает бот: в состоянии
-        # отметка обновляется не при каждом запуске и для этого не годится
+        # когда проверка была в последний раз, знает бот — больше это негде спросить
         last = None
         if bot_configured():
             try:
@@ -590,8 +514,11 @@ def main():
 
     if args.watches:
         for url, watchers in collect_jobs().items():
-            who = ", ".join(w["chat_id"] + (" (" + w["alias"] + ")" if w["alias"] else "")
-                            for w in watchers)
+            who = ", ".join(
+                watcher["chat_id"]
+                + (" (" + watcher["alias"] + ")" if watcher["alias"] else "")
+                + (" — открыто" if watcher["available"] else "")
+                for watcher in watchers)
             print(f"{url}  ←  {who}")
         return 0
 

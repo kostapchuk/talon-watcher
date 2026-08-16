@@ -15,16 +15,16 @@ compatibility_date = "2026-08-01"
 [vars]
 OWNER_CHAT_ID = "536541305"
 GH_REPO = "kostapchuk/talon-watcher"
-STATE_URL = "https://raw.githubusercontent.com/kostapchuk/talon-watcher/main/state.json"
 
-# Хранилище подписчиков и их слежек.
+# Хранилище: подписчики, их слежки и состояние каждой слежки.
+# Другого хранилища у проекта нет — проверялка в Actions ничего не помнит.
 # id — идентификатор namespace из панели: Storage & Databases → KV
 [[kv_namespaces]]
 binding = "SUBS"
 id = "ЗАМЕНИ_НА_ID_KV_NAMESPACE"
 
-# Точное расписание: воркер раз в 10 минут просит GitHub запустить проверку.
+# Точное расписание: воркер раз в 5 минут просит GitHub запустить проверку.
 # Родной крон GitHub оставлен включённым — он ненадёжен, но и не мешает:
 # одновременные запуски воркфлоу выстраиваются в очередь, а не дублируются.
 [triggers]
-crons = ["*/10 * * * *"]
+crons = ["*/5 * * * *"]
