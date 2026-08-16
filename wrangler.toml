@@ -21,7 +21,7 @@ GH_REPO = "kostapchuk/talon-watcher"
 # id — идентификатор namespace из панели: Storage & Databases → KV
 [[kv_namespaces]]
 binding = "SUBS"
-id = "ЗАМЕНИ_НА_ID_KV_NAMESPACE"
+id = "7be5d358416e4f57bad4bd268ad85881"
 
 # Единственное расписание проекта: воркер раз в 15 минут просит GitHub
 # запустить проверку. Своего крона у воркфлоу нет — у Cloudflare время точное.
