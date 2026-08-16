@@ -50,7 +50,6 @@ const COMMANDS = [
   { command: "add", description: "Вставь ссылку на врача с talon.by и, если хочешь, название" },
   { command: "list", description: "Мои слежки и их состояние" },
   { command: "remove", description: "Перестать следить за врачом" },
-  { command: "check", description: "Проверить прямо сейчас" },
   { command: "start", description: "Подписаться на уведомления" },
   { command: "stop", description: "Отписаться от уведомлений" },
 ];
@@ -84,7 +83,6 @@ function intro(limit) {
     "/add <i>ссылка на врача</i> — следить за ним",
     "/list — мои слежки",
     "/remove — перестать следить",
-    "/check — проверить прямо сейчас",
     "/stop — отписаться",
   ].join("\n");
 }
@@ -627,12 +625,11 @@ async function handleUpdate(env, update) {
     return;
   }
 
-  if (command === "/check") {
-    await checkNow(env, chatId);
-    return;
-  }
-
   if (isOwner(env, chatId)) {
+    if (command === "/check") {
+      await checkNow(env, chatId);
+      return;
+    }
     if (command === "/users") {
       await showUsers(env, chatId);
       return;
