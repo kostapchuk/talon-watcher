@@ -44,6 +44,7 @@ const DEFAULT_MAX_WATCHES = 3;
 const LIMIT_CEILING = 20; // предохранитель от опечатки в /limit
 const PAID = "paid"; // вид слежки; для бесплатных талонов будет свой
 const DONATE_TIERS = [10, 25, 50]; // звёзды: на что можно нажать в /donate
+const DONATE_CEILING = 2500; // предохранитель от лишнего нуля в /donate
 
 // Описания видно в меню команд Telegram — по ним человек и понимает,
 // что дописать после команды. Поэтому здесь не «добавить врача»,
@@ -74,13 +75,15 @@ const HOW_TO_ADD = [
     "хоть без — тоже сработает.",
 ].join("\n");
 
-// Сумму не спрашиваем текстом: каждая величина — своя команда-ссылка,
-// как /remove_<id>. Нажал — сразу счёт, без лишнего разговора.
+// Ступеньки — команды-ссылки, как /remove_<id>: нажал и сразу счёт,
+// без лишнего разговора. Но это только ярлыки, число можно назвать любое.
 const DONATE_HOW = [
   "Бот бесплатный и таким останется. Но если хочется поддержать — можно " +
     "звёздами, они уходят на хостинг:",
   "",
   ...DONATE_TIERS.map((stars) => `/donate_${stars} — ⭐ ${stars}`),
+  "",
+  `Или сколько не жалко: <code>/donate 500</code>, до ${DONATE_CEILING}.`,
 ].join("\n");
 
 const INTRO = [
@@ -533,7 +536,9 @@ async function checkNow(env, chatId) {
 // ---------------------------------------------------------------------------
 
 async function donate(env, chatId, stars) {
-  if (!DONATE_TIERS.includes(stars)) {
+  // Ступеньки ничем не выделены: годится любое целое число до потолка,
+  // а он тут не ради приличий, а чтобы лишний ноль не стал счётом.
+  if (!Number.isInteger(stars) || stars < 1 || stars > DONATE_CEILING) {
     await text(env, chatId, DONATE_HOW);
     return;
   }
@@ -785,7 +790,10 @@ async function handleUpdate(env, update) {
   }
 
   if (command === "/donate" || command.startsWith("/donate_")) {
-    await donate(env, chatId, Number(command.slice("/donate_".length)));
+    const asked = command.includes("_")
+      ? command.slice(command.indexOf("_") + 1)
+      : (body.split(/\s+/)[1] || "");
+    await donate(env, chatId, Number(asked));
     return;
   }
 
