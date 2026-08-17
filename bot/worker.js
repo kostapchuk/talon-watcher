@@ -30,6 +30,7 @@
  *   index:watches      — чаты, у которых слежки есть
  *   heartbeat:<chatId> — сообщение-табло с временем проверки
  *   trigger:<chatId>   — когда человек последний раз просил проверить вручную
+ *   donate:<chatId>:<chargeId> — оплаченный донат; id платежа нужен для возврата
  *   last_check         — когда проверка отчитывалась в последний раз
  *   fails              — сколько проверок подряд сайт не открывается
  *
@@ -42,6 +43,7 @@
 const DEFAULT_MAX_WATCHES = 3;
 const LIMIT_CEILING = 20; // предохранитель от опечатки в /limit
 const PAID = "paid"; // вид слежки; для бесплатных талонов будет свой
+const DONATE_TIERS = [50, 100, 250]; // звёзды: на что можно нажать в /donate
 
 // Описания видно в меню команд Telegram — по ним человек и понимает,
 // что дописать после команды. Поэтому здесь не «добавить врача»,
@@ -52,6 +54,7 @@ const COMMANDS = [
   { command: "remove", description: "Перестать следить за врачом" },
   { command: "start", description: "Подписаться на уведомления" },
   { command: "stop", description: "Отписаться от уведомлений" },
+  { command: "donate", description: "Поддержать бота звёздами" },
 ];
 
 const EXAMPLE_URL = "https://talon.by/policlinic/klinika-merci/doctors/89829";
@@ -71,6 +74,15 @@ const HOW_TO_ADD = [
     "хоть без — тоже сработает.",
 ].join("\n");
 
+// Сумму не спрашиваем текстом: каждая величина — своя команда-ссылка,
+// как /remove_<id>. Нажал — сразу счёт, без лишнего разговора.
+const DONATE_HOW = [
+  "Бот бесплатный и таким останется. Но если хочется поддержать — можно " +
+    "звёздами, они уходят на хостинг:",
+  "",
+  ...DONATE_TIERS.map((stars) => `/donate_${stars} — ⭐ ${stars}`),
+].join("\n");
+
 const INTRO = [
   "Слежу за записью к врачам на talon.by и пишу, когда появилась запись. " +
     "Проверяю возможность записи на приём каждые 15 минут.",
@@ -79,6 +91,7 @@ const INTRO = [
   "/list — мои слежки",
   "/remove — перестать следить",
   "/stop — отписаться",
+  "/donate — поддержать бота звёздами",
 ].join("\n");
 
 function plural(count, one, few, many) {
@@ -506,6 +519,68 @@ async function checkNow(env, chatId) {
 }
 
 // ---------------------------------------------------------------------------
+// Донат звёздами
+//
+// Звёзды (валюта XTR) — внутренние платежи Telegram: платёжный провайдер
+// в BotFather не нужен, provider_token не передаётся вовсе, а amount в prices —
+// это сами звёзды, без умножения на сотню, как в обычных валютах.
+//
+// Оплата идёт в три шага и каждый приходит своим апдейтом:
+//   sendInvoice → pre_checkout_query (подтвердить за 10 секунд)
+//                 → message.successful_payment
+// Поэтому в setWebhook перечислен pre_checkout_query, а handleUpdate разбирает
+// сообщения без текста: у successful_payment текста нет.
+// ---------------------------------------------------------------------------
+
+async function donate(env, chatId, stars) {
+  if (!DONATE_TIERS.includes(stars)) {
+    await text(env, chatId, DONATE_HOW);
+    return;
+  }
+
+  const response = await api(env, "sendInvoice", {
+    chat_id: chatId,
+    title: "Поддержать вотчер",
+    description: "На хостинг и на то, чтобы бот не забывал проверять талоны.",
+    payload: `donate:${stars}`, // вернётся в successful_payment
+    currency: "XTR",
+    prices: [{ label: `⭐ ${stars}`, amount: stars }],
+  });
+
+  if (!response.ok) {
+    console.error(`sendInvoice -> ${response.status}: ${(await response.text()).slice(0, 200)}`);
+    await text(env, chatId, "Счёт не выставился. Попробуй ещё раз чуть позже.");
+  }
+}
+
+/**
+ * Оплата прошла. Кладём id платежа в KV: без него возврат сделать нечем,
+ * а Telegram второй раз его не покажет.
+ */
+async function thanks(env, chatId, payment, chat) {
+  const stars = payment.total_amount;
+  const charge = payment.telegram_payment_charge_id;
+
+  await env.SUBS.put(`donate:${chatId}:${charge}`, JSON.stringify({
+    stars,
+    at: new Date().toISOString(),
+  }));
+
+  await text(env, chatId,
+    `Спасибо! ⭐ ${stars} — очень тепло.\n\n` +
+    "Если что-то пошло не так, напиши владельцу: звёзды можно вернуть.");
+
+  if (env.OWNER_CHAT_ID && !isOwner(env, chatId)) {
+    const who = [chat.first_name, chat.last_name].filter(Boolean).join(" ") ||
+      (chat.username ? "@" + chat.username : "без имени");
+    await text(env, String(env.OWNER_CHAT_ID),
+      `⭐ <b>Донат ${stars}</b> от ${esc(who)}\n` +
+      `<code>${chatId}</code>\n\n` +
+      `Вернуть: <code>/refund ${chatId} ${charge}</code>`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Команды владельца. В меню Telegram их нет: оно одно на всех, а эти команды
 // касаются только хозяина бота. Всем остальным они отвечают как незнакомые.
 // ---------------------------------------------------------------------------
@@ -577,10 +652,79 @@ async function setLimit(env, chatId, args) {
     `${plural(size, "врачом", "врачами", "врачами")}.`);
 }
 
+/**
+ * /refund                    — что кому оплачено, готовыми командами
+ * /refund <chatId> <chargeId> — вернуть звёзды
+ *
+ * Возврат делает сам Telegram: звёзды уходят обратно человеку, а у бота
+ * списываются. Свежий донат может не попасть в список ещё около минуты —
+ * перебор ключей в KV отстаёт от записи; в этом случае команду на возврат
+ * можно взять из сообщения о донате.
+ */
+async function refund(env, chatId, args) {
+  if (args.length < 2) {
+    const listed = await env.SUBS.list({ prefix: "donate:" });
+    if (!listed.keys.length) {
+      await text(env, chatId, "Донатов пока не было.");
+      return;
+    }
+
+    const lines = [];
+    let total = 0;
+    for (const key of listed.keys) {
+      const [, person, charge] = key.name.split(":");
+      const info = JSON.parse(await env.SUBS.get(key.name) || "{}");
+      total += Number(info.stars) || 0;
+      lines.push(`• ⭐ ${info.stars} от <code>${person}</code>, ${moment(info.at)}\n` +
+        `  вернуть: <code>/refund ${person} ${charge}</code>`);
+    }
+
+    await text(env, chatId, `Донатов: ${lines.length}, всего ⭐ ${total}\n\n` +
+      lines.join("\n"));
+    return;
+  }
+
+  const person = args[0].replace(/[^\d-]/g, "");
+  const charge = args[1];
+  const response = await api(env, "refundStarPayment", {
+    user_id: Number(person),
+    telegram_payment_charge_id: charge,
+  });
+
+  if (!response.ok) {
+    const detail = (await response.text()).slice(0, 200);
+    console.error(`refundStarPayment -> ${response.status}: ${detail}`);
+    await text(env, chatId, `Не вернулось: <code>${esc(detail)}</code>`);
+    return;
+  }
+
+  await env.SUBS.delete(`donate:${person}:${charge}`);
+  await text(env, chatId, `Вернул звёзды <code>${person}</code>.`);
+  await text(env, person, "Вернул звёзды — они уже у тебя. Спасибо, что попробовал!");
+}
+
 async function handleUpdate(env, update) {
+  // Telegram ждёт ответа 10 секунд, иначе отменит оплату сам. Проверять тут
+  // нечего: товара нет, есть добрая воля, — поэтому просто ok.
+  if (update.pre_checkout_query) {
+    await api(env, "answerPreCheckoutQuery", {
+      pre_checkout_query_id: update.pre_checkout_query.id,
+      ok: true,
+    });
+    return;
+  }
+
   const message = update.message;
   const chat = message && message.chat;
-  if (!chat || !chat.id || typeof message.text !== "string") return;
+  if (!chat || !chat.id) return;
+
+  // Сообщение об оплате приходит без текста — разбираем его до общей проверки
+  if (message.successful_payment) {
+    await thanks(env, String(chat.id), message.successful_payment, chat);
+    return;
+  }
+
+  if (typeof message.text !== "string") return;
 
   const chatId = String(chat.id);
   const body = message.text.trim();
@@ -640,6 +784,11 @@ async function handleUpdate(env, update) {
     return;
   }
 
+  if (command === "/donate" || command.startsWith("/donate_")) {
+    await donate(env, chatId, Number(command.slice("/donate_".length)));
+    return;
+  }
+
   if (isOwner(env, chatId)) {
     if (command === "/check") {
       await checkNow(env, chatId);
@@ -651,6 +800,10 @@ async function handleUpdate(env, update) {
     }
     if (command === "/limit") {
       await setLimit(env, chatId, body.split(/\s+/).slice(1));
+      return;
+    }
+    if (command === "/refund") {
+      await refund(env, chatId, body.split(/\s+/).slice(1));
       return;
     }
   }
@@ -838,7 +991,8 @@ export default {
       const webhook = await api(env, "setWebhook", {
         url: `${url.origin}/webhook`,
         secret_token: env.WEBHOOK_SECRET,
-        allowed_updates: ["message"],
+        // pre_checkout_query обязателен: без него оплата звёздами не дойдёт
+        allowed_updates: ["message", "pre_checkout_query"],
         drop_pending_updates: false,
       });
       const menu = await api(env, "setMyCommands", { commands: COMMANDS });
